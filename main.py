@@ -45,23 +45,23 @@ def save_config(cfg):
 
 class OvertimeCalcWindow:
     """加班百分比计算器窗口"""
-    def __init__(self, parent, p=0, q=116, y=0, weekend=0):
+    def __init__(self, parent, p=0, q=116, y=0, quarter_end=''):
         self.window = tk.Toplevel(parent)
         self.window.title('加班时长百分比计算器')
-        self.window.geometry('500x480')
+        self.window.geometry('500x500')
         self.window.resizable(True, True)
 
-        self.build_ui(p, q, y, weekend)
+        self.build_ui(p, q, y, quarter_end)
 
-    def build_ui(self, p, q, y, weekend):
+    def build_ui(self, p, q, y, quarter_end):
         input_frame = ttk.LabelFrame(self.window, text='参数设置', padding=10)
         input_frame.pack(padx=15, pady=10, fill='x')
 
         params = [
             ('p', 'p (已加班时长/小时):', str(p)),
             ('q', 'q (满加班时长/小时):', str(q)),
-            ('y', 'y (未来加班天数):', '1'),
-            ('weekend', 'weekend (未来周末加班总时长/小时):', '0'),
+            ('y', 'y (本季度剩余工作日/天):', str(y)),
+            ('weekend', 'weekend (未来休息日加班总时长/小时):', '0'),
             ('base_time', '加班起算时间:', '17:20'),
             ('h步长', 'h步长 (每次递增/小时):', '0.5'),
             ('循环次数', '循环次数:', '11'),
@@ -74,6 +74,10 @@ class OvertimeCalcWindow:
             entry.insert(0, default)
             entry.grid(row=i, column=1, padx=5, pady=3)
             self.entries[key] = entry
+
+        if quarter_end:
+            ttk.Label(self.window, text=f'y 已自动填入本季度剩余工作日（季度截至 {quarter_end}，可手动修改）',
+                      foreground='gray').pack(pady=2)
 
         btn_frame = ttk.Frame(self.window)
         btn_frame.pack(pady=5)
@@ -205,18 +209,19 @@ class AttendanceApp:
             result = run_scrape(self.config, progress)
             self.root.after(0, lambda: self.on_done(result))
         except Exception as e:
-            self.root.after(0, lambda: self.on_error(str(e)))
+            # except块结束时会自动删除e，必须先取出消息再交给延迟执行的lambda
+            msg = str(e)
+            self.root.after(0, lambda: self.on_error(msg))
 
     def on_done(self, result):
         self.run_btn.config(state='normal')
         self.status_var.set('完成')
 
-        # 解析结果，提取参数
+        # 解析结果，提取参数（y为自动计算的本季度剩余工作日）
         p = result.get('total_overtime_hours', 0)
         q = result.get('full_overtime_hours', 116)
-        y = result.get('workday_count', 0)
-        weekend = result.get('weekend_overtime_hours', 0)
-        unchecked_days = result.get('unchecked_days', 0)
+        y = result.get('remaining_quarter_workdays', 0)
+        quarter_end = result.get('quarter_end_date', '')
 
         # 显示结果摘要
         summary = (
@@ -224,12 +229,13 @@ class AttendanceApp:
             f"总加班: {result.get('total_overtime_str', '')}\n"
             f"满额加班: {result.get('full_overtime_str', '')}\n"
             f"加班时长百分比: {result.get('percent', 0):.2f}%\n"
+            f"本季度剩余工作日: {y} 天（截至 {quarter_end}）\n"
             f"已保存到: {result.get('csv_file', '')}"
         )
         messagebox.showinfo('完成', summary)
 
         # 打开计算器，自动填充参数
-        OvertimeCalcWindow(self.root, p=p, q=q, y=y, weekend=weekend)
+        OvertimeCalcWindow(self.root, p=p, q=q, y=y, quarter_end=quarter_end)
 
     def on_error(self, msg):
         self.run_btn.config(state='normal')

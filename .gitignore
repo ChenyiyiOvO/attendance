@@ -5,3 +5,7 @@ browser_data/
 *.spec
 *.log
 __pycache__/
+
+.codegraph/
+打卡记录.csv
+holidays.json

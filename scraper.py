@@ -1,5 +1,3 @@
-from playwright.sync_api import sync_playwright
-from bs4 import BeautifulSoup
 import json
 import time
 import csv
@@ -8,49 +6,220 @@ import sys
 import urllib.request
 from datetime import datetime, timedelta
 
-# 缓存节假日数据
-_holiday_cache = {}
+# ==================== 节假日/调休数据 ====================
+# 数据源 holiday-cn（https://github.com/NateScarlet/holiday-cn，按国务院公告自动更新）
+# 按年拉取后缓存到本地，运行时全部为本地字典查询，不再逐日请求在线接口。
+# 查找顺序：本地缓存(holidays.json) -> 内置快照 -> 缺失年份联网拉取一次 -> 按周一~周五近似兜底
 
-def is_workday(date_str):
-    """
-    判断指定日期是否为工作日（包括调休工作日）
-    :param date_str: 日期字符串，格式为 'YYYY-MM-DD'
-    :return: True表示工作日，False表示节假日或周末
-    """
-    if date_str in _holiday_cache:
-        return _holiday_cache[date_str]
-    
+HOLIDAY_CACHE_FILE = 'holidays.json'
+HOLIDAY_CN_URLS = [
+    'https://cdn.jsdelivr.net/gh/NateScarlet/holiday-cn@master/{year}.json',
+    'https://raw.githubusercontent.com/NateScarlet/holiday-cn/master/{year}.json',
+]
+HOLIDAY_RETRY_INTERVAL = 24 * 3600  # 某年联网拉取失败后，24小时内不重复请求
+
+# 内置快照：2024-2026年法定节假日与调休安排（取自holiday-cn，原始出处为国务院公告）
+# True=放假(休息日)，False=调休上班(工作日)
+_BUILTIN_HOLIDAYS = {
+    '2024': {
+        '2024-01-01': True, '2024-02-04': False, '2024-02-10': True,
+        '2024-02-11': True, '2024-02-12': True, '2024-02-13': True,
+        '2024-02-14': True, '2024-02-15': True, '2024-02-16': True,
+        '2024-02-17': True, '2024-02-18': False, '2024-04-04': True,
+        '2024-04-05': True, '2024-04-06': True, '2024-04-07': False,
+        '2024-04-28': False, '2024-05-01': True, '2024-05-02': True,
+        '2024-05-03': True, '2024-05-04': True, '2024-05-05': True,
+        '2024-05-11': False, '2024-06-10': True, '2024-09-14': False,
+        '2024-09-15': True, '2024-09-16': True, '2024-09-17': True,
+        '2024-09-29': False, '2024-10-01': True, '2024-10-02': True,
+        '2024-10-03': True, '2024-10-04': True, '2024-10-05': True,
+        '2024-10-06': True, '2024-10-07': True, '2024-10-12': False,
+    },
+    '2025': {
+        '2025-01-01': True, '2025-01-26': False, '2025-01-28': True,
+        '2025-01-29': True, '2025-01-30': True, '2025-01-31': True,
+        '2025-02-01': True, '2025-02-02': True, '2025-02-03': True,
+        '2025-02-04': True, '2025-02-08': False, '2025-04-04': True,
+        '2025-04-05': True, '2025-04-06': True, '2025-04-27': False,
+        '2025-05-01': True, '2025-05-02': True, '2025-05-03': True,
+        '2025-05-04': True, '2025-05-05': True, '2025-05-31': True,
+        '2025-06-01': True, '2025-06-02': True, '2025-09-28': False,
+        '2025-10-01': True, '2025-10-02': True, '2025-10-03': True,
+        '2025-10-04': True, '2025-10-05': True, '2025-10-06': True,
+        '2025-10-07': True, '2025-10-08': True, '2025-10-11': False,
+    },
+    '2026': {
+        '2026-01-01': True, '2026-01-02': True, '2026-01-03': True,
+        '2026-01-04': False, '2026-02-14': False, '2026-02-15': True,
+        '2026-02-16': True, '2026-02-17': True, '2026-02-18': True,
+        '2026-02-19': True, '2026-02-20': True, '2026-02-21': True,
+        '2026-02-22': True, '2026-02-23': True, '2026-02-28': False,
+        '2026-04-04': True, '2026-04-05': True, '2026-04-06': True,
+        '2026-05-01': True, '2026-05-02': True, '2026-05-03': True,
+        '2026-05-04': True, '2026-05-05': True, '2026-05-09': False,
+        '2026-06-19': True, '2026-06-20': True, '2026-06-21': True,
+        '2026-09-20': False, '2026-09-25': True, '2026-09-26': True,
+        '2026-09-27': True, '2026-10-01': True, '2026-10-02': True,
+        '2026-10-03': True, '2026-10-04': True, '2026-10-05': True,
+        '2026-10-06': True, '2026-10-07': True, '2026-10-10': False,
+    },
+}
+
+# 运行内存缓存：{日期: 是否放假}，以及各年份最近一次联网拉取失败的时间戳
+_holiday_cache = {}
+_holiday_failed = {}
+_holiday_loaded = False
+
+
+def _holiday_cache_path():
+    return os.path.join(app_dir(), HOLIDAY_CACHE_FILE)
+
+
+def _load_holiday_cache():
+    """进程内首次使用时，把内置快照和本地缓存文件加载进内存"""
+    global _holiday_loaded, _holiday_failed
+    if _holiday_loaded:
+        return
+    _holiday_loaded = True
+    for year_days in _BUILTIN_HOLIDAYS.values():
+        _holiday_cache.update(year_days)
     try:
-        dt = datetime.strptime(date_str, '%Y-%m-%d')
-        weekday = dt.weekday()  # 0=周一, 5=周六, 6=周日
-    except:
-        _holiday_cache[date_str] = False
-        return False
-    
-    # 周一到周五默认是工作日
-    if weekday < 5:
-        _holiday_cache[date_str] = True
-        return True
-    
-    # 周六日需要调API检查是否为调休工作日
-    try:
-        url = f'https://timor.tech/api/holiday/info/{date_str}'
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read().decode('utf-8'))
-        
-        if data['code'] == 0:
-            holiday_info = data.get('holiday')
-            # holiday为false表示调休工作日（周末补班）
-            if holiday_info is not None and holiday_info.get('holiday') == False:
-                _holiday_cache[date_str] = True
-                return True
+        with open(_holiday_cache_path(), 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        for year_days in data.get('years', {}).values():
+            _holiday_cache.update(year_days)
+        _holiday_failed = data.get('failed', {})
     except Exception:
         pass
-    
-    # 周末（非调休）或API失败：非工作日
-    _holiday_cache[date_str] = False
-    return False
+
+
+def _save_holiday_cache(new_years, new_failed):
+    """把联网拉取到的年度数据/失败记录合并写入本地缓存文件"""
+    try:
+        path = _holiday_cache_path()
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+        data.setdefault('years', {}).update(new_years)
+        failed = dict(data.get('failed', {}))
+        failed.update(new_failed)
+        for ys in new_years:
+            failed.pop(ys, None)
+        if failed:
+            data['failed'] = failed
+        else:
+            data.pop('failed', None)
+        data['updated'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=1)
+    except Exception:
+        pass
+
+
+def _fetch_year_days(year):
+    """联网获取某一年的节假日数据，返回 {日期: 是否放假}，失败返回None"""
+    for url in HOLIDAY_CN_URLS:
+        try:
+            req = urllib.request.Request(url.format(year=year), headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                data = json.loads(resp.read().decode('utf-8'))
+            days = data.get('days')
+            if isinstance(days, list) and days:
+                return {d['date']: bool(d['isOffDay']) for d in days if d.get('date')}
+        except Exception:
+            continue
+    return None
+
+
+def ensure_holiday_data(start_date, end_date, progress=None):
+    """确保查询范围覆盖年份的节假日数据就绪（缓存优先，仅缺失的年份联网拉取一次）"""
+    _load_holiday_cache()
+    try:
+        y0 = datetime.strptime(start_date, '%Y-%m-%d').year
+        y1 = datetime.strptime(end_date, '%Y-%m-%d').year
+    except ValueError:
+        return
+    now = time.time()
+    new_years, new_failed = {}, {}
+    for year in range(y0, y1 + 1):
+        ys = str(year)
+        if any(d.startswith(ys) for d in _holiday_cache):
+            continue
+        if ys in _BUILTIN_HOLIDAYS:
+            _holiday_cache.update(_BUILTIN_HOLIDAYS[ys])
+            continue
+        last_fail = _holiday_failed.get(ys)
+        if isinstance(last_fail, (int, float)) and now - last_fail < HOLIDAY_RETRY_INTERVAL:
+            continue
+        if progress:
+            progress(f'联网获取{ys}年节假日/调休安排...')
+        days = _fetch_year_days(year)
+        if days:
+            _holiday_cache.update(days)
+            new_years[ys] = days
+        else:
+            new_failed[ys] = now
+    if new_years or new_failed:
+        _save_holiday_cache(new_years, new_failed)
+
+
+def day_type(date_str):
+    """
+    判断日期类型
+    :param date_str: 日期字符串，格式为 'YYYY-MM-DD'
+    :return: 'workday' 工作日（含周末调休上班日）；'rest' 休息日（周末和法定节假日）
+    数据只覆盖内置快照/缓存年份；其余年份可用 run_scrape 前先调 ensure_holiday_data 联网补齐，
+    否则按周一~周五近似判断。
+    """
+    _load_holiday_cache()
+    if date_str in _holiday_cache:
+        return 'rest' if _holiday_cache[date_str] else 'workday'
+    try:
+        return 'workday' if datetime.strptime(date_str, '%Y-%m-%d').weekday() < 5 else 'rest'
+    except ValueError:
+        return 'rest'
+
+
+def is_workday(date_str):
+    """判断是否工作日（含调休上班日；法定节假日即使是周一~周五也不算）"""
+    return day_type(date_str) == 'workday'
+
+
+def quarter_bounds(date_str):
+    """
+    返回日期所在季度的第一天和最后一天（'YYYY-MM-DD'）
+    季度划分：1-3月 / 4-6月 / 7-9月 / 10-12月
+    """
+    dt = datetime.strptime(date_str, '%Y-%m-%d')
+    start_month = (dt.month - 1) // 3 * 3 + 1
+    first = dt.replace(month=start_month, day=1)
+    if start_month == 10:
+        last = dt.replace(month=12, day=31)
+    else:
+        last = dt.replace(month=start_month + 3, day=1) - timedelta(days=1)
+    return first.strftime('%Y-%m-%d'), last.strftime('%Y-%m-%d')
+
+
+def remaining_quarter_workdays(end_date):
+    """
+    计算 end_date（不含）到其所在季度末的剩余工作日天数
+    调休上班的周末算工作日，法定节假日（即使在周中）不算
+    """
+    try:
+        _, quarter_last = quarter_bounds(end_date)
+        d = datetime.strptime(end_date, '%Y-%m-%d')
+        last = datetime.strptime(quarter_last, '%Y-%m-%d')
+    except ValueError:
+        return 0
+    count = 0
+    while d < last:
+        d += timedelta(days=1)
+        if is_workday(d.strftime('%Y-%m-%d')):
+            count += 1
+    return count
+
 
 def resource_path(relative_path):
     if hasattr(sys, '_MEIPASS'):
@@ -87,10 +256,13 @@ def calc_overtime(check_in_str, check_out_str, date_str, work_end='17:20'):
     :param date_str: 日期字符串，格式为 'YYYY-MM-DD'
     :param work_end: 正常下班时间
     :return: 加班时长（分钟）
+
+    工作日（含调休上班日）：加班 = 下班打卡时间 - 正常下班时间
+    休息日（周末+法定节假日）：全天计加班 = 下班打卡时间 - 上班打卡时间
     """
     try:
         co = datetime.strptime(check_out_str.strip(), '%H:%M:%S')
-        
+
         # 判断是否为调休工作日
         if is_workday(date_str):
             # 调休工作日：加班 = 下班时间 - 17:20
@@ -100,7 +272,7 @@ def calc_overtime(check_in_str, check_out_str, date_str, work_end='17:20'):
             # 普通周末：加班 = 下班时间 - 上班时间
             ci = datetime.strptime(check_in_str.strip(), '%H:%M:%S')
             diff = (co - ci).total_seconds() / 60
-        
+
         return max(diff, 0)
     except:
         return 0
@@ -156,6 +328,42 @@ def get_csv_date_range(csv_file):
                     last_date = date_str
     return first_date, last_date
 
+def build_results(records, start_date, end_date, work_end_time, unchecked_days):
+    """
+    计算查询范围内每条记录的加班时长和汇总数据
+    - 工作日（含调休上班日）：加班 = 下班打卡 - 正常下班时间；
+      只打了上班卡的视为17:20准时下班（0加班，仍计入分母）
+    - 休息日（周末+法定节假日）：有打卡即全天计加班 = 下班打卡 - 上班打卡（不计入分母）
+    :return: (明细列表, 汇总dict)
+    """
+    all_results = []
+    for date_str in sorted(records.keys()):
+        if start_date <= date_str <= end_date:
+            rec = records[date_str]
+            if len(rec) >= 4 and rec[2]:
+                overtime_min = calc_overtime(rec[2], rec[3], date_str, work_end_time)
+                all_results.append([date_str, rec[1], rec[2], rec[3], fmt_hours(overtime_min), overtime_min])
+
+    total_overtime_min = sum(r[5] for r in all_results)
+    weekend_overtime_min = sum(r[5] for r in all_results if not is_workday(r[0]))
+    workday_count = sum(1 for r in all_results if is_workday(r[0]))
+    denominator = (unchecked_days + workday_count) * 4 * 60
+    percent = total_overtime_min / denominator * 100 if denominator > 0 else 0
+
+    summary = {
+        'total_overtime_hours': total_overtime_min / 60,
+        'total_overtime_str': fmt_hours(total_overtime_min),
+        'full_overtime_hours': denominator / 60,
+        'full_overtime_str': fmt_hours(denominator),
+        'percent': percent,
+        'workday_count': workday_count,
+        'unchecked_days': unchecked_days,
+        'weekend_overtime_hours': weekend_overtime_min / 60,
+        'quarter_end_date': quarter_bounds(end_date)[1],
+        'remaining_quarter_workdays': remaining_quarter_workdays(end_date),
+    }
+    return all_results, summary
+
 def run_scrape(config, progress=None):
 
     def emit(msg):
@@ -180,49 +388,26 @@ def run_scrape(config, progress=None):
             '%26serviceId%3DqBEWMTx%252FSFqo38ksWGkgPfI9KRA%253D'
         )
 
+    # 节假日/调休数据按年缓存，仅在缺失时联网补一次
+    emit('正在检查节假日/调休数据...')
+    ensure_holiday_data(start_date, end_date, emit)
+
     csv_file = os.path.join(app_dir(), '打卡记录.csv')
     existing_records = read_existing_csv(csv_file)
     csv_first, csv_last = get_csv_date_range(csv_file)
+    unchecked_days = int(config.get('unchecked_days', '0') or 0)
 
     # 情况1：CSV完全覆盖查询范围，直接用已有数据重新计算
     if existing_records and csv_first and csv_last:
         if start_date >= csv_first and end_date <= csv_last:
             emit('已有完整数据，无需登录查询...')
-            # 只计算查询范围内的加班时长
-            all_results = []
-            for date_str in sorted(existing_records.keys()):
-                if start_date <= date_str <= end_date:
-                    rec = existing_records[date_str]
-                    if len(rec) >= 4 and rec[2] and rec[3]:
-                        overtime_min = calc_overtime(rec[2], rec[3], date_str, work_end_time)
-                        overtime_str = fmt_hours(overtime_min)
-                        all_results.append([date_str, rec[1], rec[2], rec[3], overtime_str, overtime_min])
-
-            all_results.sort(key=lambda x: x[0])
-            total_overtime_min = sum(
-                calc_overtime(r[2], r[3], r[0], work_end_time)
-                for r in all_results if r[2] and r[3]
-            )
-            weekend_overtime_min = sum(
-                calc_overtime(r[2], r[3], r[0], work_end_time)
-                for r in all_results if r[2] and r[3] and not is_workday(r[0])
-            )
-            workday_count = sum(1 for r in all_results if is_workday(r[0]))
-            unchecked_days = int(config.get('unchecked_days', '0') or 0)
-            denominator = (unchecked_days + workday_count) * 4 * 60
-            percent = total_overtime_min / denominator * 100 if denominator > 0 else 0
+            all_results, summary = build_results(
+                existing_records, start_date, end_date, work_end_time, unchecked_days)
 
             return {
                 'record_count': len(all_results),
-                'total_overtime_hours': total_overtime_min / 60,
-                'total_overtime_str': fmt_hours(total_overtime_min),
-                'full_overtime_hours': denominator / 60,
-                'full_overtime_str': fmt_hours(denominator),
-                'percent': percent,
-                'workday_count': workday_count,
-                'unchecked_days': unchecked_days,
-                'weekend_overtime_hours': weekend_overtime_min / 60,
                 'csv_file': csv_file,
+                **summary,
             }
 
     # 情况2：需要爬取缺失日期
@@ -244,6 +429,10 @@ def run_scrape(config, progress=None):
         emit(f'已有 {len(existing_records)} 条记录，仅爬取缺失日期...')
     else:
         emit('无历史记录，全量爬取...')
+
+    # 浏览器相关依赖仅在需要登录爬取时才导入
+    from playwright.sync_api import sync_playwright
+    from bs4 import BeautifulSoup
 
     with sync_playwright() as p:
         emit('正在启动浏览器...')
@@ -360,53 +549,24 @@ def run_scrape(config, progress=None):
                 date_str = rec[0]
                 merged[date_str] = rec[:4]
 
-            # 计算查询范围内的记录
-            all_results = []
-            for date_str in sorted(merged.keys()):
-                if start_date <= date_str <= end_date:
-                    rec = merged[date_str]
-                    if len(rec) >= 4 and rec[2] and rec[3]:
-                        overtime_min = calc_overtime(rec[2], rec[3], date_str, work_end_time)
-                        overtime_str = fmt_hours(overtime_min)
-                        all_results.append([date_str, rec[1], rec[2], rec[3], overtime_str, overtime_min])
+            all_results, summary = build_results(
+                merged, start_date, end_date, work_end_time, unchecked_days)
 
-            all_results.sort(key=lambda x: x[0])
-            total_overtime_min = sum(
-                calc_overtime(r[2], r[3], r[0], work_end_time)
-                for r in all_results if r[2] and r[3]
-            )
-            weekend_overtime_min = sum(
-                calc_overtime(r[2], r[3], r[0], work_end_time)
-                for r in all_results if r[2] and r[3] and not is_workday(r[0])
-            )
-            workday_count = sum(1 for r in all_results if is_workday(r[0]))
-            unchecked_days = int(config.get('unchecked_days', '0') or 0)
-            denominator = (unchecked_days + workday_count) * 4 * 60
-            percent = total_overtime_min / denominator * 100 if denominator > 0 else 0
-
-            # 保存所有合并后的记录到CSV
+            # 保存所有合并后的记录到CSV（只打上班卡的行也保留，便于下次增量）
             with open(csv_file, 'w', newline='', encoding='utf-8-sig') as f:
                 writer = csv.writer(f)
                 writer.writerow(['日期', '星期', '上班时间', '下班时间', '加班时间'])
                 for date_str in sorted(merged.keys()):
                     rec = merged[date_str]
-                    if len(rec) >= 4 and rec[2] and rec[3]:
+                    if len(rec) >= 4 and rec[2]:
                         ot_min = calc_overtime(rec[2], rec[3], date_str, work_end_time)
-                        ot_str = fmt_hours(ot_min)
-                        writer.writerow([date_str, rec[1], rec[2], rec[3], ot_str])
+                        writer.writerow([date_str, rec[1], rec[2], rec[3], fmt_hours(ot_min)])
 
             return {
                 'record_count': len(all_results),
                 'new_count': len(new_records),
-                'total_overtime_hours': total_overtime_min / 60,
-                'total_overtime_str': fmt_hours(total_overtime_min),
-                'full_overtime_hours': denominator / 60,
-                'full_overtime_str': fmt_hours(denominator),
-                'percent': percent,
-                'workday_count': workday_count,
-                'unchecked_days': unchecked_days,
-                'weekend_overtime_hours': weekend_overtime_min / 60,
                 'csv_file': csv_file,
+                **summary,
             }
 
         finally:
