@@ -1,56 +1,47 @@
 from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
-import json
 import time
 import csv
 import os
 import sys
-import urllib.request
 from datetime import datetime, timedelta
+
+try:
+    # 离线法定节假日数据（含每年调休补班安排）
+    from chinese_calendar import is_workday as _cn_is_workday
+except ImportError:
+    _cn_is_workday = None
 
 # 缓存节假日数据
 _holiday_cache = {}
 
 def is_workday(date_str):
     """
-    判断指定日期是否为工作日（包括调休工作日）
+    判断指定日期是否为工作日（周末调休补班算工作日，周中的法定节假日不算）
     :param date_str: 日期字符串，格式为 'YYYY-MM-DD'
     :return: True表示工作日，False表示节假日或周末
     """
     if date_str in _holiday_cache:
         return _holiday_cache[date_str]
-    
+
     try:
-        dt = datetime.strptime(date_str, '%Y-%m-%d')
-        weekday = dt.weekday()  # 0=周一, 5=周六, 6=周日
-    except:
+        dt = datetime.strptime(date_str, '%Y-%m-%d').date()
+    except ValueError:
         _holiday_cache[date_str] = False
         return False
-    
-    # 周一到周五默认是工作日
-    if weekday < 5:
-        _holiday_cache[date_str] = True
-        return True
-    
-    # 周六日需要调API检查是否为调休工作日
-    try:
-        url = f'https://timor.tech/api/holiday/info/{date_str}'
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read().decode('utf-8'))
-        
-        if data['code'] == 0:
-            holiday_info = data.get('holiday')
-            # holiday为false表示调休工作日（周末补班）
-            if holiday_info is not None and holiday_info.get('holiday') == False:
-                _holiday_cache[date_str] = True
-                return True
-    except Exception:
-        pass
-    
-    # 周末（非调休）或API失败：非工作日
-    _holiday_cache[date_str] = False
-    return False
+
+    if _cn_is_workday is not None:
+        try:
+            result = bool(_cn_is_workday(dt))
+        except NotImplementedError:
+            # 库数据未覆盖该年份（如下一年放假安排未发布），退回周一~周五近似
+            result = dt.weekday() < 5
+    else:
+        # 未安装chinese_calendar时的近似处理
+        result = dt.weekday() < 5
+
+    _holiday_cache[date_str] = result
+    return result
 
 def resource_path(relative_path):
     if hasattr(sys, '_MEIPASS'):
